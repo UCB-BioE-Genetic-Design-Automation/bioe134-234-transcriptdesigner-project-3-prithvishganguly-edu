@@ -144,6 +144,55 @@ class TranscriptDesigner:
             k=1
         )[0]
 
+    def _repair_promoter(self, codons: list, peptide: str, utr: str) -> list:
+        """
+        Targeted repair for promoter failures.
+
+        The promoter checker returns the exact 29bp sequence that triggered
+        the PWM threshold. We find that sequence in the CDS, identify which
+        codons it overlaps, and re-sample just those codons with weighted
+        random alternatives. This is cheap — only runs on the ~4% of genes
+        that fail the promoter check.
+
+        Parameters
+        ----------
+        codons  : current codon list (includes stop codon)
+        peptide : amino acid sequence
+        utr     : RBS UTR string (uppercase)
+
+        Returns
+        -------
+        New codon list with the promoter region re-sampled.
+        """
+        cds = ''.join(codons)
+        transcript_dna = utr + cds
+        promoter_ok, psite = self.promoterChecker.run(transcript_dna)
+
+        if promoter_ok or not psite:
+            return codons  # nothing to fix
+
+        # Find where the problematic 29bp sequence starts in transcript_dna
+        pos = transcript_dna.find(psite)
+        utr_len = len(utr)
+
+        new_codons = list(codons)
+
+        if pos >= utr_len:
+            # Promoter is inside the CDS — find overlapping codons
+            cds_pos = pos - utr_len
+            # The 29bp window spans roughly 10 codons
+            first_codon = max(1, cds_pos // 3)          # never touch codon 0
+            last_codon  = min(len(peptide) - 1, (cds_pos + 29) // 3 + 1)
+            for i in range(first_codon, last_codon + 1):
+                if i < len(peptide):
+                    new_codons[i] = self._weighted_codon(peptide[i])
+        else:
+            # Promoter spans the UTR/CDS junction — re-sample first ~5 codons
+            for i in range(1, min(6, len(peptide))):
+                new_codons[i] = self._weighted_codon(peptide[i])
+
+        return new_codons
+
     def _fast_score(self, codons: list, utr: str) -> int:
         """
         Fast scoring using only cheap string-search checkers.
@@ -243,16 +292,30 @@ class TranscriptDesigner:
         best_score = self._full_score(codons[:-1], final_utr)
         best_codons = codons
 
+        # Phase 2b: targeted promoter repair — only runs on ~4% of genes
+        # Repeat up to 5 times since each repair is cheap
+        if best_score < 5:
+            _, psite = self.promoterChecker.run(final_utr + ''.join(best_codons))
+            if psite:
+                for _ in range(5):
+                    repaired = self._repair_promoter(best_codons, peptide, final_utr)
+                    repaired_score = self._full_score(repaired[:-1], final_utr)
+                    if repaired_score > best_score:
+                        best_score = repaired_score
+                        best_codons = repaired
+                    if best_score == 5:
+                        break
+
         # Phase 3: weighted random fallback if full check not perfect
+        # Use the already-known UTR — RBS won't change since we always
+        # pick the first available option for the same ignores set
         if best_score < 5:
             for _ in range(self.FALLBACK_ATTEMPTS):
                 fallback = [self._get_start_codon(peptide[0])]
                 fallback += [self._weighted_codon(aa) for aa in peptide[1:]]
                 fallback.append('TAA')
 
-                fb_cds = ''.join(fallback)
-                fb_rbs = self.rbsChooser.run(fb_cds, ignores)
-                fb_score = self._full_score(fallback[:-1], fb_rbs.utr.upper())
+                fb_score = self._full_score(fallback[:-1], utr)
 
                 if fb_score > best_score:
                     best_score = fb_score
