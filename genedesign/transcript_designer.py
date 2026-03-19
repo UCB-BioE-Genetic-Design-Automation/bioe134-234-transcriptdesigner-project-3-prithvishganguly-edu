@@ -1,59 +1,75 @@
+"""
+transcript_designer.py
+
+Improved TranscriptDesigner using a fast sliding window algorithm.
+
+Speed strategy
+--------------
+The sliding window only runs CHEAP checkers (forbidden sequences and
+internal RBS) during window enumeration. These are simple string searches
+and run in microseconds.
+
+The EXPENSIVE checkers (hairpin, promoter, codon) are only run once on
+the final complete sequence, with a small number of weighted random
+fallback retries if needed.
+
+This makes the sliding window practical on a full proteome.
+
+Algorithm
+---------
+1. Left to right, 1 codon at a time, 3aa lookahead window
+2. Only top 2 codons per AA considered (keeps combinations at 2^3 = 8 max)
+3. Score each combo with fast checkers only
+4. Lock in best codon for current position, advance
+5. Final full check with all 5 checkers
+6. Weighted random fallback retries if final check fails
+
+Checkers
+--------
+Window scoring (fast):
+  - ForbiddenSequenceChecker
+  - InternalRBSChecker
+
+Final check (all 5):
+  - CodonChecker
+  - ForbiddenSequenceChecker
+  - hairpin_checker
+  - PromoterChecker
+  - InternalRBSChecker
+"""
+
 import random
+from itertools import product
+
 from genedesign.rbs_chooser import RBSChooser
 from genedesign.models.transcript import Transcript
 from genedesign.checkers.codon_checker import CodonChecker
 from genedesign.checkers.forbidden_sequence_checker import ForbiddenSequenceChecker
 from genedesign.checkers.hairpin_checker import hairpin_checker
 from genedesign.checkers.internal_promoter_checker import PromoterChecker
+from genedesign.checkers.internal_rbs_checker import InternalRBSChecker
+
 
 class TranscriptDesigner:
-    """
-    Improved TranscriptDesigner that reverse translates a protein sequence into
-    a codon-optimized DNA sequence satisfying four biological quality checks:
 
-        1. CodonChecker             - high CAI, low rare codons, good diversity
-        2. ForbiddenSequenceChecker - no restriction sites or repeat motifs
-        3. hairpin_checker          - no mRNA hairpins blocking translation
-        4. PromoterChecker          - no accidental internal sigma70 promoters
-
-    Strategy: simulated annealing retry.
-        - Attempt 0: greedy (best codon per amino acid).
-        - Attempts 1-N: increasingly random codon sampling.
-        - Each attempt checks RBS UTR + CDS together, matching the benchmarker.
-        - Returns the first design passing all 4 checks, or best seen if exhausted.
-
-    Start codon handling:
-        - If protein starts with M: use ATG (standard).
-        - If protein starts with anything else: use the best codon for that AA,
-          which the benchmarker accepts as long as it translates back correctly.
-          The CDS will still start with a valid codon for that amino acid.
-          Note: GTG and TTG are alternative start codons in E. coli but encode
-          Val and Leu respectively when translated — we handle this by keeping
-          the first amino acid codon faithful to the input sequence.
-    """
-
-    MAX_ATTEMPTS = 50
+    WINDOW_SIZE = 3
+    TOP_N_CODONS = 2
+    FALLBACK_ATTEMPTS = 20
 
     def __init__(self):
         self.rbsChooser = None
         self.codonChecker = None
         self.forbiddenChecker = None
         self.promoterChecker = None
+        self.internalRBSChecker = None
         self.bestCodon = {}
         self.allCodons = {}
-
-        # Valid start codons in E. coli mapped to the amino acid they encode
-        # when used as a start codon (vs internal codon)
-        # ATG → M, GTG → V (but acts as start), TTG → L (but acts as start)
-        self.altStartCodons = {
-            'V': 'GTG',  # Valine — valid alternative start in E. coli
-            'L': 'TTG',  # Leucine — valid alternative start in E. coli
-        }
+        self.topCodons = {}
+        self.codonWeights = {}
+        self.altStartCodons = {'V': 'GTG', 'L': 'TTG'}
 
     def initiate(self) -> None:
-        """
-        Initializes all sub-components and codon lookup tables.
-        """
+
         self.rbsChooser = RBSChooser()
         self.rbsChooser.initiate()
 
@@ -66,8 +82,9 @@ class TranscriptDesigner:
         self.promoterChecker = PromoterChecker()
         self.promoterChecker.initiate()
 
-        # Best single codon per amino acid (highest CAI for E. coli).
-        # Used as the greedy baseline on attempt 0.
+        self.internalRBSChecker = InternalRBSChecker()
+        self.internalRBSChecker.initiate()
+
         self.bestCodon = {
             'A': 'GCG', 'C': 'TGC', 'D': 'GAT', 'E': 'GAA', 'F': 'TTC',
             'G': 'GGT', 'H': 'CAC', 'I': 'ATC', 'K': 'AAA', 'L': 'CTG',
@@ -75,44 +92,44 @@ class TranscriptDesigner:
             'S': 'TCT', 'T': 'ACC', 'V': 'GTT', 'W': 'TGG', 'Y': 'TAC'
         }
 
-        # All synonymous codons per amino acid.
-        # Every codon encodes the correct amino acid — verified against standard
-        # genetic code. Used for randomization during retry attempts.
-        self.allCodons = {
-            'A': ['GCT', 'GCC', 'GCA', 'GCG'],
-            'C': ['TGT', 'TGC'],
-            'D': ['GAT', 'GAC'],
-            'E': ['GAA', 'GAG'],
-            'F': ['TTT', 'TTC'],
-            'G': ['GGT', 'GGC', 'GGA', 'GGG'],
-            'H': ['CAT', 'CAC'],
-            'I': ['ATT', 'ATC', 'ATA'],
-            'K': ['AAA', 'AAG'],
-            'L': ['TTA', 'TTG', 'CTT', 'CTC', 'CTA', 'CTG'],
-            'M': ['ATG'],
-            'N': ['AAT', 'AAC'],
-            'P': ['CCT', 'CCC', 'CCA', 'CCG'],
-            'Q': ['CAA', 'CAG'],
-            'R': ['CGT', 'CGC', 'CGA', 'CGG', 'AGA', 'AGG'],
-            'S': ['TCT', 'TCC', 'TCA', 'TCG', 'AGT', 'AGC'],
-            'T': ['ACT', 'ACC', 'ACA', 'ACG'],
-            'V': ['GTT', 'GTC', 'GTA', 'GTG'],
-            'W': ['TGG'],
-            'Y': ['TAT', 'TAC'],
+        codon_freq = {
+            'A': [('GCG', 0.33), ('GCC', 0.26), ('GCA', 0.23), ('GCT', 0.18)],
+            'C': [('TGC', 0.54), ('TGT', 0.46)],
+            'D': [('GAT', 0.63), ('GAC', 0.37)],
+            'E': [('GAA', 0.68), ('GAG', 0.32)],
+            'F': [('TTC', 0.58), ('TTT', 0.42)],
+            'G': [('GGT', 0.38), ('GGC', 0.37), ('GGG', 0.15), ('GGA', 0.09)],
+            'H': [('CAC', 0.57), ('CAT', 0.43)],
+            'I': [('ATC', 0.42), ('ATT', 0.28), ('ATA', 0.08)],
+            'K': [('AAA', 0.74), ('AAG', 0.26)],
+            'L': [('CTG', 0.54), ('TTA', 0.11), ('TTG', 0.11),
+                  ('CTT', 0.10), ('CTC', 0.10), ('CTA', 0.04)],
+            'M': [('ATG', 1.0)],
+            'N': [('AAC', 0.51), ('AAT', 0.49)],
+            'P': [('CCG', 0.55), ('CCA', 0.20), ('CCT', 0.16), ('CCC', 0.10)],
+            'Q': [('CAG', 0.69), ('CAA', 0.31)],
+            'R': [('CGT', 0.42), ('CGC', 0.37), ('CGA', 0.06),
+                  ('CGG', 0.07), ('AGA', 0.04), ('AGG', 0.04)],
+            'S': [('AGC', 0.24), ('TCT', 0.17), ('TCC', 0.15),
+                  ('AGT', 0.16), ('TCA', 0.14), ('TCG', 0.15)],
+            'T': [('ACC', 0.40), ('ACG', 0.28), ('ACT', 0.17), ('ACA', 0.15)],
+            'V': [('GTG', 0.35), ('GTT', 0.28), ('GTC', 0.20), ('GTA', 0.17)],
+            'W': [('TGG', 1.0)],
+            'Y': [('TAC', 0.57), ('TAT', 0.43)],
         }
 
-    def _get_start_codon(self, first_aa: str) -> str:
-        """
-        Returns the correct start codon for the first amino acid.
+        self.allCodons = {aa: [c for c, _ in pairs] for aa, pairs in codon_freq.items()}
+        self.codonWeights = {aa: [w for _, w in pairs] for aa, pairs in codon_freq.items()}
+        self.topCodons = {
+            aa: [c for c, _ in pairs[:self.TOP_N_CODONS]]
+            for aa, pairs in codon_freq.items()
+        }
 
-        E. coli recognises ATG, GTG, and TTG as start codons.
-        - M always uses ATG.
-        - V can use GTG (preferred alternative start).
-        - L can use TTG (preferred alternative start).
-        - All other amino acids: use their standard best codon.
-          The benchmarker checks translation correctness, so we must
-          use a codon that actually encodes the right amino acid.
-        """
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_start_codon(self, first_aa: str) -> str:
         if first_aa == 'M':
             return 'ATG'
         elif first_aa in self.altStartCodons:
@@ -120,114 +137,143 @@ class TranscriptDesigner:
         else:
             return self.bestCodon[first_aa]
 
-    def _get_start_codon_random(self, first_aa: str) -> str:
+    def _weighted_codon(self, aa: str) -> str:
+        return random.choices(
+            self.allCodons[aa],
+            weights=self.codonWeights[aa],
+            k=1
+        )[0]
+
+    def _fast_score(self, codons: list, utr: str) -> int:
         """
-        Returns a random valid codon for the first amino acid during retries.
-        Same logic as _get_start_codon but randomized from allCodons.
+        Fast scoring using only cheap string-search checkers.
+        Used during sliding window enumeration.
+        Returns 0-2.
         """
-        if first_aa == 'M':
-            return 'ATG'
-        elif first_aa in self.altStartCodons:
-            return self.altStartCodons[first_aa]
-        else:
-            return random.choice(self.allCodons[first_aa])
+        cds = ''.join(codons)
+        transcript_dna = utr + cds
+        forbidden_ok, _ = self.forbiddenChecker.run(transcript_dna)
+        rbs_ok, _       = self.internalRBSChecker.run(cds)
+        return sum([forbidden_ok, rbs_ok])
+
+    def _full_score(self, codons: list, utr: str) -> int:
+        """
+        Full scoring using all 5 checkers.
+        Used only on final sequence and fallback retries.
+        Returns 0-5.
+        """
+        cds = ''.join(codons)
+        transcript_dna = utr + cds
+        codon_ok, _, _, _ = self.codonChecker.run(codons)
+        forbidden_ok, _   = self.forbiddenChecker.run(transcript_dna)
+        hairpin_ok, _     = hairpin_checker(transcript_dna)
+        promoter_ok, _    = self.promoterChecker.run(transcript_dna)
+        rbs_ok, _         = self.internalRBSChecker.run(cds)
+        return sum([codon_ok, forbidden_ok, hairpin_ok, promoter_ok, rbs_ok])
+
+    # ------------------------------------------------------------------
+    # Sliding window
+    # ------------------------------------------------------------------
+
+    def _sliding_window_design(self, peptide: str, utr: str) -> list:
+        """
+        Fast sliding window: only cheap checkers used during enumeration.
+        """
+        chosen = []
+
+        for i in range(len(peptide)):
+            aa = peptide[i]
+
+            if i == 0:
+                chosen.append(self._get_start_codon(aa))
+                continue
+
+            window_aas = peptide[i:i + self.WINDOW_SIZE]
+            options_per_pos = [self.topCodons[a] for a in window_aas]
+
+            best_score = -1
+            best_codon_for_i = self.topCodons[aa][0]
+
+            for combo in product(*options_per_pos):
+                candidate = chosen + list(combo)
+                score = self._fast_score(candidate, utr)
+                if score > best_score:
+                    best_score = score
+                    best_codon_for_i = combo[0]
+
+            chosen.append(best_codon_for_i)
+
+        return chosen
+
+    # ------------------------------------------------------------------
+    # Main run
+    # ------------------------------------------------------------------
 
     def run(self, peptide: str, ignores: set) -> Transcript:
         """
         Designs a Transcript for the given peptide sequence.
 
-        Parameters:
-            peptide (str): Amino acid sequence (single-letter codes, no stop symbol).
-            ignores (set): RBS options to exclude (passed to RBSChooser).
+        Parameters
+        ----------
+        peptide : str
+            Amino acid sequence (single-letter codes, no stop symbol).
+        ignores : set
+            RBS options to exclude.
 
-        Returns:
-            Transcript: The best designed transcript found within MAX_ATTEMPTS.
+        Returns
+        -------
+        Transcript
         """
-        # Clean the input
         peptide = peptide.strip().rstrip('*').upper()
 
-        first_aa = peptide[0]
-        rest = peptide[1:]
+        # Get UTR for context scoring
+        placeholder_cds = self._get_start_codon(peptide[0]) + \
+                          ''.join(self.bestCodon[aa] for aa in peptide[1:]) + 'TAA'
+        candidate_rbs = self.rbsChooser.run(placeholder_cds, ignores)
+        utr = candidate_rbs.utr.upper()
 
-        best_codons = None
-        best_pass_count = -1
+        # Phase 1: fast sliding window
+        codons = self._sliding_window_design(peptide, utr)
+        codons.append('TAA')
 
-        for attempt in range(self.MAX_ATTEMPTS):
+        # Phase 2: full score on complete sequence
+        cds = ''.join(codons)
+        final_rbs = self.rbsChooser.run(cds, ignores)
+        final_utr = final_rbs.utr.upper()
+        best_score = self._full_score(codons[:-1], final_utr)
+        best_codons = codons
 
-            # ------------------------------------------------------------------
-            # Step 1: Generate a candidate codon list
-            # ------------------------------------------------------------------
-            if attempt == 0:
-                # Greedy: best codon for every position
-                # First AA gets special start codon handling
-                start_codon = self._get_start_codon(first_aa)
-                codons = [start_codon] + [self.bestCodon[aa] for aa in rest]
-            else:
-                # Randomised retry with increasing randomness
-                randomness = attempt / self.MAX_ATTEMPTS
-                start_codon = self._get_start_codon(first_aa) if random.random() > randomness \
-                              else self._get_start_codon_random(first_aa)
-                codons = [start_codon]
-                for aa in rest:
-                    if random.random() < randomness:
-                        codons.append(random.choice(self.allCodons[aa]))
-                    else:
-                        codons.append(self.bestCodon[aa])
+        # Phase 3: weighted random fallback if full check not perfect
+        if best_score < 5:
+            for _ in range(self.FALLBACK_ATTEMPTS):
+                fallback = [self._get_start_codon(peptide[0])]
+                fallback += [self._weighted_codon(aa) for aa in peptide[1:]]
+                fallback.append('TAA')
 
-            # Always append a stop codon (TAA preferred in E. coli)
-            codons.append('TAA')
+                fb_cds = ''.join(fallback)
+                fb_rbs = self.rbsChooser.run(fb_cds, ignores)
+                fb_score = self._full_score(fallback[:-1], fb_rbs.utr.upper())
 
-            # ------------------------------------------------------------------
-            # Step 2: Build transcript DNA including RBS UTR
-            # The benchmarker validates rbs.utr + cds, so we check the same.
-            # ------------------------------------------------------------------
-            cds = ''.join(codons)
-            candidate_rbs = self.rbsChooser.run(cds, ignores)
-            transcript_dna = candidate_rbs.utr.upper() + cds
+                if fb_score > best_score:
+                    best_score = fb_score
+                    best_codons = fallback
 
-            # ------------------------------------------------------------------
-            # Step 3: Run all 4 checkers with correct input types
-            #   - CodonChecker  → takes codons LIST
-            #   - Others        → take transcript DNA STRING
-            # ------------------------------------------------------------------
-            codon_ok, _, _, _ = self.codonChecker.run(codons)
-            forbidden_ok, _   = self.forbiddenChecker.run(transcript_dna)
-            hairpin_ok, _     = hairpin_checker(transcript_dna)
-            promoter_ok, _    = self.promoterChecker.run(transcript_dna)
+                if best_score == 5:
+                    break
 
-            pass_count = sum([codon_ok, forbidden_ok, hairpin_ok, promoter_ok])
-
-            # ------------------------------------------------------------------
-            # Step 4: Track best result seen
-            # ------------------------------------------------------------------
-            if pass_count > best_pass_count:
-                best_pass_count = pass_count
-                best_codons = codons
-
-            # ------------------------------------------------------------------
-            # Step 5: Stop if all 4 pass
-            # ------------------------------------------------------------------
-            if pass_count == 4:
-                break
-
-        # ----------------------------------------------------------------------
-        # Step 6: Return the best Transcript found
-        # ----------------------------------------------------------------------
         final_cds = ''.join(best_codons)
         selected_rbs = self.rbsChooser.run(final_cds, ignores)
         return Transcript(selected_rbs, peptide, best_codons)
 
 
 if __name__ == "__main__":
-    # Test with a standard M-start protein
-    peptide = "MYPFIRTARMTV"
     designer = TranscriptDesigner()
     designer.initiate()
     ignores = set()
-    transcript = designer.run(peptide, ignores)
-    print(transcript)
 
-    # Test with a non-M start protein (like many in the proteome)
-    peptide2 = "GYNVTMRDIK"
-    transcript2 = designer.run(peptide2, ignores)
-    print(transcript2)
+    t1 = designer.run("MYPFIRTARMTV", ignores)
+    print("Standard:", t1.codons)
+
+    t2 = designer.run("MKKKKKKK", ignores)
+    print("MKKKKKKK:", t2.codons)
+    print("Has poly-A?", "AAAAAAAA" in ''.join(t2.codons))
